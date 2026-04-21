@@ -547,6 +547,21 @@ const App: React.FC = () => {
     showToast(`Classification updated — matches recomputed`);
   };
 
+  const reclassifyCreative = async (id: string) => {
+    const item = creatives.find(c => c.id === id);
+    if (!item) return;
+
+    setCreatives(prev => prev.map(c => c.id === id ? { ...c, isReclassifying: true } : c));
+    try {
+      const { heroAngle, callouts } = await classifyDesignImage(item.file);
+      setCreatives(prev => prev.map(c => c.id === item.id ? { ...c, isReclassifying: false, heroAngle: heroAngle as PrimaryAngle, callouts, unverified: false } : c));
+      showToast('Redetected callouts');
+    } catch (e) {
+      console.error("Design classification failed", e);
+      setCreatives(prev => prev.map(c => c.id === item.id ? { ...c, isReclassifying: false, unverified: true } : c));
+    }
+  };
+
   const smartMatches = useMemo<SmartMatch[]>(() => {
     return creatives.map(design => {
       let heroSource = null;
@@ -592,22 +607,28 @@ const App: React.FC = () => {
       }
 
       // Find callouts
-      const calloutSources: CalloutMatch[] = (design.callouts || []).map(co => {
-        if (override?.calloutSourceIds?.[co.feature]) {
-          const source = products.find(p => p.id === override.calloutSourceIds![co.feature]) || null;
-          if (source) return { feature: co.feature as DetailFeature, source, matchType: 'custom' };
+      const calloutSources: CalloutMatch[] = (design.callouts || []).map((co, coIdx) => {
+        const overrideKey = `callout_${coIdx}`;
+        if (override?.calloutSourceIds?.[overrideKey]) {
+          const source = products.find(p => p.id === override.calloutSourceIds![overrideKey]) || null;
+          if (source) return { feature: co.feature as DetailFeature, label_visible: co.label_visible, source, matchType: 'custom' };
+        }
+
+        let matchType: 'exact' | 'reconstruction' | 'unknown' = 'reconstruction';
+        if (co.feature === 'unknown') {
+          matchType = 'unknown';
         }
 
         const source = products.find(p => p.tag === co.feature);
-        if (source) {
-          return { feature: co.feature as DetailFeature, source, matchType: 'exact' };
+        if (source && co.feature !== 'unknown') {
+          return { feature: co.feature as DetailFeature, label_visible: co.label_visible, source, matchType: 'exact' };
         }
-        return { feature: co.feature as DetailFeature, source: null, matchType: 'reconstruction' };
+        return { feature: co.feature as DetailFeature, label_visible: co.label_visible, source: null, matchType };
       });
 
       let overallMatchType: 'exact' | 'approximate' | 'mixed' | 'missing' | 'custom' = 'exact';
 
-      const hasApproxCallout = calloutSources.some(c => c.matchType === 'reconstruction');
+      const hasApproxCallout = calloutSources.some(c => c.matchType === 'reconstruction' || c.matchType === 'unknown');
       const hasExactCallout = calloutSources.some(c => c.matchType === 'exact');
       
       const allManuallyOrExactOverridden = (heroMatchType === 'exact' || heroMatchType === 'custom') && 
@@ -713,7 +734,7 @@ const App: React.FC = () => {
           const heroFile = match.heroSource?.file || products[0]?.file;
           const heroUrl = match.heroSource?.url || products[0]?.url;
           
-          const validCallouts = match.calloutSources.filter(c => c.matchType === 'exact' && c.source?.file);
+          const validCallouts = match.calloutSources.filter(c => (c.matchType === 'exact' || c.matchType === 'custom') && c.source?.file);
           const calloutFiles = validCallouts.map(c => ({
             feature: c.feature,
             file: c.source!.file,
@@ -950,21 +971,34 @@ const App: React.FC = () => {
                 <div key={i} className="relative aspect-square rounded-lg overflow-hidden border border-white/10 group">
                   <TagPill 
                     tag={c.heroAngle} 
-                    isClassifying={c.isClassifying} 
+                    isClassifying={c.isClassifying || c.isReclassifying} 
                     unverified={c.unverified}
                     isManual={c.manualHeroAngle}
                     options={TAGS.filter(t => ['front', 'back', 'three_quarter', 'side', 'top_down', 'bottom'].includes(t))}
                     onOverride={(tag) => overrideTag(c.id, 'creative', tag)}
                   />
-                  <img src={c.url} className="w-full h-full object-cover" />
-                  <button 
-                    onClick={() => removeCreative(i)}
-                    className="absolute top-1 right-1 p-1 bg-black/50 rounded-full opacity-0 group-hover:opacity-100 transition-opacity z-20"
-                  >
-                    <XCircleIcon className="w-4 h-4 text-red-400" />
-                  </button>
-                  {c.callouts && c.callouts.length > 0 && (
-                    <div className="absolute bottom-1 right-1 bg-black/60 text-white text-[9px] rounded px-1 z-20">
+                  <img src={c.url} className={`w-full h-full object-cover ${(c.isClassifying || c.isReclassifying) ? 'opacity-50 blur-sm' : ''}`} />
+                  <div className="absolute top-1 right-1 flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity z-20">
+                    <button 
+                      onClick={() => removeCreative(i)}
+                      className="p-1 bg-black/50 hover:bg-black/80 rounded-full"
+                      title="Remove design"
+                    >
+                      <XCircleIcon className="w-4 h-4 text-red-400" />
+                    </button>
+                    {!c.isClassifying && !c.isReclassifying && (
+                      <button 
+                        onClick={() => reclassifyCreative(c.id)}
+                        className="p-1 bg-black/50 hover:bg-black/80 rounded-full flex items-center justify-center"
+                        title="Re-detect callouts"
+                      >
+                        <HistoryIcon className="w-4 h-4 text-purple-400" />
+                      </button>
+                    )}
+                  </div>
+                  {c.callouts !== undefined && !c.isClassifying && !c.isReclassifying && (
+                    <div className="absolute bottom-1 right-1 bg-black/60 text-white text-[9px] rounded px-1 z-20 flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-purple-500"></span>
                       {c.callouts.length} callouts
                     </div>
                   )}
@@ -1133,20 +1167,22 @@ const App: React.FC = () => {
                       </div>
 
                       {/* Callout matches */}
-                      {match.calloutSources.map((co, coIdx) => (
+                      {match.calloutSources.map((co, coIdx) => {
+                        const calloutKey = `callout_${coIdx}`;
+                        return (
                         <div 
                           key={coIdx} 
                           className="flex flex-col items-center gap-1 w-12 shrink-0 group/slot rounded transition-colors border border-transparent outline-none focus-visible:ring-2 focus-visible:ring-purple-500 relative cursor-pointer"
                           tabIndex={0}
                           onClick={(e) => {
                             e.stopPropagation();
-                            setPickerState({ designId: match.design.id, featureOrHero: co.feature });
+                            setPickerState({ designId: match.design.id, featureOrHero: calloutKey });
                           }}
                           onKeyDown={(e) => {
                             if (e.key === 'Enter' || e.key === ' ') {
                               e.preventDefault();
                               e.stopPropagation();
-                              setPickerState({ designId: match.design.id, featureOrHero: co.feature });
+                              setPickerState({ designId: match.design.id, featureOrHero: calloutKey });
                             }
                           }}
                           onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('bg-white/10', 'border-white/30'); }}
@@ -1155,13 +1191,13 @@ const App: React.FC = () => {
                               e.preventDefault();
                               e.currentTarget.classList.remove('bg-white/10', 'border-white/30');
                               const productId = e.dataTransfer.getData('text/plain');
-                              if (productId) handleSlotDrop(match.design.id, co.feature, productId);
+                              if (productId) handleSlotDrop(match.design.id, calloutKey, productId);
                           }}
                         >
-                          {pickerState?.designId === match.design.id && pickerState?.featureOrHero === co.feature && (
+                          {pickerState?.designId === match.design.id && pickerState?.featureOrHero === calloutKey && (
                             <SlotPicker 
                               products={products} 
-                              onSelect={(id) => handleSlotDrop(match.design.id, co.feature, id)} 
+                              onSelect={(id) => handleSlotDrop(match.design.id, calloutKey, id)} 
                               onClose={() => setPickerState(null)} 
                             />
                           )}
@@ -1174,14 +1210,27 @@ const App: React.FC = () => {
                               {co.matchType === 'custom' && <div className="absolute top-0 right-0 bg-amber-500/90 backdrop-blur-sm text-black text-[7px] font-bold px-1 rounded-bl z-10">M</div>}
                             </div>
                           ) : (
-                            <div className="w-12 h-12 rounded border border-dashed border-yellow-500/50 flex flex-col items-center justify-center bg-yellow-500/10 p-1 pointer-events-none" title={co.feature}>
-                              <SparklesIcon className="w-3 h-3 text-yellow-400 mb-1" />
-                              <span className="text-[7px] text-yellow-400 uppercase text-center leading-tight">AI<br/>Gen</span>
+                            <div className={`w-12 h-12 rounded border border-dashed ${co.matchType === 'unknown' ? 'border-red-500/50 bg-red-500/10' : 'border-yellow-500/50 bg-yellow-500/10'} flex flex-col items-center justify-center p-1 pointer-events-none`} title={co.feature}>
+                              {co.matchType === 'unknown' ? (
+                                <>
+                                  <AlertCircleIcon className="w-3 h-3 text-red-400 mb-1" />
+                                  <span className="text-[7px] text-red-400 uppercase text-center leading-tight">Need<br/>Tag</span>
+                                </>
+                              ) : (
+                                <>
+                                  <SparklesIcon className="w-3 h-3 text-yellow-400 mb-1" />
+                                  <span className="text-[7px] text-yellow-400 uppercase text-center leading-tight">AI<br/>Gen</span>
+                                </>
+                              )}
                             </div>
                           )}
-                          <span className="text-[8px] text-gray-400 uppercase w-full text-center truncate" title={co.feature}>{co.feature.replace('_',' ')}</span>
+                          <div className="flex flex-col items-center w-full min-w-0" title={co.label_visible ? `${co.label_visible} (${co.feature})` : co.feature}>
+                            {co.label_visible && <span className="text-[8px] text-gray-300 font-medium w-full text-center truncate">{co.label_visible}</span>}
+                            <span className="text-[7px] text-gray-500 uppercase w-full text-center truncate">{co.feature.replace('_',' ')}</span>
+                          </div>
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
 
                     {/* Overall Status Badge */}

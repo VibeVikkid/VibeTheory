@@ -21,7 +21,8 @@ export interface ClassifiedProduct {
 
 export interface CalloutDef {
   index: number;
-  feature: DetailFeature;
+  feature: DetailFeature | 'unknown';
+  label_visible?: string;
 }
 
 export interface ClassifiedDesign {
@@ -31,14 +32,16 @@ export interface ClassifiedDesign {
   heroAngle?: PrimaryAngle;
   callouts?: CalloutDef[];
   isClassifying?: boolean;
+  isReclassifying?: boolean;
   unverified?: boolean;
   manualHeroAngle?: boolean;
 }
 
 export interface CalloutMatch {
-  feature: DetailFeature;
+  feature: DetailFeature | 'unknown';
+  label_visible?: string;
   source: ClassifiedProduct | null;
-  matchType: 'exact' | 'reconstruction' | 'custom';
+  matchType: 'exact' | 'reconstruction' | 'custom' | 'unknown';
 }
 
 export interface SmartMatch {

@@ -332,7 +332,7 @@ Choose the single most accurate tag.`
   });
 };
 
-export const classifyDesignImage = async (designFile: File, abortSignal?: AbortSignal): Promise<{ heroAngle: string; callouts: { index: number, feature: string }[] }> => {
+export const classifyDesignImage = async (designFile: File, abortSignal?: AbortSignal): Promise<{ heroAngle: string; callouts: { index: number, feature: string, label_visible?: string }[] }> => {
   return withRetry(async () => {
     const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY;
     if (!apiKey) {
@@ -356,25 +356,64 @@ export const classifyDesignImage = async (designFile: File, abortSignal?: AbortS
     const heroAngle = heroResponse.candidates?.[0]?.content?.parts?.[0]?.text?.trim().toLowerCase() || 'front';
 
     const calloutPrompt = {
-      text: `This design has multiple callout cards, each showing a close-up detail of the product. For each callout card, identify which feature it shows. Respond in JSON format: [{"index": 1, "feature": "interior"}, {"index": 2, "feature": "zipper"}]. Use only these feature tags: interior, zipper, strap, pattern, hardware, pocket, water_resistance, size_reference, lifestyle. Order the array in reading order (top-left first, then row by row). If there are no callouts, return an empty array []. Output raw JSON only.`
+      text: `Look at this marketing design and count ONLY the callout cards that are visually present. A callout card is a small boxed/bordered panel containing a zoomed product detail image plus a label.
+
+Step 1: Count the callout cards you can actually see. Write the count first.
+
+Step 2: For each callout you counted, identify what feature its zoomed detail image shows. Use ONLY these tags:
+interior, zipper, strap, pattern, hardware, pocket, water_resistance, size_reference, lifestyle
+
+Rules:
+- Do not invent callouts that aren't in the image
+- Do not list features that 'would typically' be in a backpack design
+- If you cannot clearly see the detail image inside a callout, tag it as 'unknown' rather than guessing
+- If the design has zero callouts, return an empty array
+- The count in Step 1 must equal the array length in Step 2
+
+Respond in this exact JSON format, nothing else:
+{
+  "count": 3,
+  "callouts": [
+    {"index": 1, "feature": "interior", "label_visible": "Smart Storage"},
+    {"index": 2, "feature": "size_reference", "label_visible": "Massive 19-Inch Size"},
+    {"index": 3, "feature": "pocket", "label_visible": "Weekend Trip Ready"}
+  ]
+}
+
+Include the label_visible field — read the text written below each callout card. This helps verify you're looking at real callouts, not imagining them.`
     };
 
-    const calloutResponse = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: {
-        parts: [designPart, calloutPrompt],
-      },
-      config: { abortSignal }
-    });
+    let callouts: any[] = [];
+    let attempts = 0;
+    while (attempts < 2) {
+      attempts++;
+      const calloutResponse = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: {
+          parts: [designPart, calloutPrompt],
+        },
+        config: { abortSignal }
+      });
 
-    let callouts = [];
-    const calloutText = calloutResponse.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-    if (calloutText) {
-      try {
-        const jsonStr = calloutText.replace(/```json/g, '').replace(/```/g, '');
-        callouts = JSON.parse(jsonStr);
-      } catch (e) {
-        console.error("Failed to parse callout JSON", e, calloutText);
+      const calloutText = calloutResponse.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+      if (calloutText) {
+        try {
+          const jsonStr = calloutText.replace(/```json/g, '').replace(/```/g, '');
+          const result = JSON.parse(jsonStr);
+          if (typeof result.count === 'number' && Array.isArray(result.callouts)) {
+            if (result.count !== result.callouts.length) {
+              console.error(`Callout length mismatch: Count is ${result.count}, but received ${result.callouts.length} callouts.`);
+              if (attempts >= 2) {
+                callouts = result.callouts; // Accept it on last attempt
+              }
+            } else {
+              callouts = result.callouts;
+              break; // Success
+            }
+          }
+        } catch (e) {
+          console.error("Failed to parse callout JSON", e, calloutText);
+        }
       }
     }
 
