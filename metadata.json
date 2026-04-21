@@ -1,0 +1,5 @@
+{
+  "name": "adaptation master",
+  "description": "Batch process creative templates by replacing products with new ones, automatically adjusting background colors and design elements to match.",
+  "requestFramePermissions": []
+}
