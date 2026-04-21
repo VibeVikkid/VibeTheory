@@ -1,7 +1,7 @@
 
 import { GoogleGenAI } from "@google/genai";
 
-const fileToGenerativePart = (file: File): Promise<{ inlineData: { data: string; mimeType: string; } }> => {
+const fileToGenerativePart = (file: File | Blob): Promise<{ inlineData: { data: string; mimeType: string; } }> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.readAsDataURL(file);
@@ -16,6 +16,15 @@ const fileToGenerativePart = (file: File): Promise<{ inlineData: { data: string;
       });
     };
     reader.onerror = (error) => reject(error);
+  });
+};
+
+const canvasToGenerativePart = (canvas: HTMLCanvasElement): Promise<{ inlineData: { data: string; mimeType: string; } }> => {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(blob => {
+      if (!blob) return reject(new Error("Canvas toBlob failed"));
+      fileToGenerativePart(blob).then(resolve).catch(reject);
+    }, 'image/png');
   });
 };
 
@@ -220,50 +229,209 @@ Before finalizing, verify:
 
 If any check fails, redo the edit.`;
 
+const SWAP_PROMPT = `You are editing a product design. Update every appearance of the product 
+to match the new product. Refresh the background to complement the new product. Leave text, layout, and callout structure identical.
+
+Inputs:
+- First image: the original design
+- Second image: the new product reference
+
+WHAT TO CHANGE:
+
+1. THE HERO PRODUCT (the large main product image):
+   - Replace with the new product from the reference
+   - Same position, same size, same camera angle
+   - Match the face/side shown in the reference (front→front, back→back)
+   - Preserve the new product's colors, pattern, branding, logos, 
+     hardware exactly as shown in the reference
+   - Small tilt up to ±15° allowed. No flipping. No mirroring.
+
+2. EVERY CALLOUT CARD'S INTERNAL IMAGE (small product detail crops):
+   - These are LOCKED design assets. Treat them like stock photography.
+   - COPY THIS EXACTLY FROM THE ORIGINAL. Same colors, same pattern, same crop, same lighting.
+   - Even though the hero product is swapped, the callout internal images MUST show the ORIGINAL product's details.
+   - This visual mismatch is INTENTIONAL and CORRECT. Do not "harmonize" the callouts to match the new hero.
+
+3. THE BACKGROUND:
+   - Sample 2–3 dominant colors from the new product (skip white, 
+     black, pure grays)
+   - Generate a soft pastel gradient using those colors (desaturate 
+     ~35%, lighten ~85%)
+   - Match the direction of the original gradient
+   - Flat and minimal — no texture, no bokeh, no effects
+
+4. OPTIONAL BACKGROUND THEME:
+   - If the original background had thematic motifs tied to the old 
+     product's design (racing stripes for a racing-print bag, graffiti 
+     for street-art, sparkles for glitter), update them to reflect the 
+     new product's theme with the same subtlety
+   - If the original was a pure gradient with no motifs, keep it as a 
+     pure gradient
+
+WHAT STAYS IDENTICAL — do not modify:
+
+- All text — every headline, subhead, label, tagline. Same words, same 
+  font, same weight, same size, same color, same position.
+- All callout labels (the words beneath each callout)
+- All callout icon badges (the small circular icons)
+- All callout card shapes, borders, shadows, corner radii, positions
+- Dotted leader lines connecting callouts to the hero
+- Brand/campaign logos placed on the design
+- Canvas dimensions (same width × height)
+- Overall layout, composition, spacing, alignment
+
+PRODUCT FIDELITY:
+
+The new product must appear accurately in the HERO slot. Use only colors, 
+branding, logos, and design elements visible in the reference image for 
+the hero. Never invent branding that isn't shown.
+
+Do NOT apply product fidelity to the callouts. Callouts are completely locked.
+
+ABSOLUTE RULES:
+
+- Never change any word of text
+- Never alter a logo on the design
+- Never change callout card shapes or labels
+- Never add elements that weren't in the original
+- When uncertain, preserve the original rather than invent`;
+
+export const classifyProductImage = async (productFile: File, abortSignal?: AbortSignal): Promise<string> => {
+  return withRetry(async () => {
+    const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error("API Key is not set. Please select an API key.");
+    }
+    const ai = new GoogleGenAI({ apiKey });
+
+    const productPart = await fileToGenerativePart(productFile);
+    const textPart = {
+      text: `Classify this product image into ONE of these 15 tags based on what view/angle it shows. Respond with ONLY the tag name, nothing else.
+
+Primary views: front, back, three_quarter, side, top_down, bottom
+Detail views: interior, zipper, strap, pattern, hardware, pocket, water_resistance, size_reference, lifestyle
+
+Choose the single most accurate tag.`
+    };
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: {
+        parts: [productPart, textPart],
+      },
+      config: {
+        abortSignal: abortSignal
+      }
+    });
+
+    const result = response.candidates?.[0]?.content?.parts?.[0]?.text?.trim().toLowerCase();
+    if (result) {
+      return result;
+    }
+    throw new Error('Could not classify product image.');
+  });
+};
+
+export const classifyDesignImage = async (designFile: File, abortSignal?: AbortSignal): Promise<{ heroAngle: string; callouts: { index: number, feature: string }[] }> => {
+  return withRetry(async () => {
+    const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error("API Key is not set. Please select an API key.");
+    }
+    const ai = new GoogleGenAI({ apiKey });
+
+    const designPart = await fileToGenerativePart(designFile);
+    const heroPrompt = {
+      text: `This is a marketing design featuring a product. What angle/view is the main/hero product shown at in this design? Respond with ONLY the tag name from this list: front, back, three_quarter, side, top_down, bottom. Choose the most accurate.`
+    };
+
+    const heroResponse = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: {
+        parts: [designPart, heroPrompt],
+      },
+      config: { abortSignal }
+    });
+    
+    const heroAngle = heroResponse.candidates?.[0]?.content?.parts?.[0]?.text?.trim().toLowerCase() || 'front';
+
+    const calloutPrompt = {
+      text: `This design has multiple callout cards, each showing a close-up detail of the product. For each callout card, identify which feature it shows. Respond in JSON format: [{"index": 1, "feature": "interior"}, {"index": 2, "feature": "zipper"}]. Use only these feature tags: interior, zipper, strap, pattern, hardware, pocket, water_resistance, size_reference, lifestyle. Order the array in reading order (top-left first, then row by row). If there are no callouts, return an empty array []. Output raw JSON only.`
+    };
+
+    const calloutResponse = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: {
+        parts: [designPart, calloutPrompt],
+      },
+      config: { abortSignal }
+    });
+
+    let callouts = [];
+    const calloutText = calloutResponse.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    if (calloutText) {
+      try {
+        const jsonStr = calloutText.replace(/```json/g, '').replace(/```/g, '');
+        callouts = JSON.parse(jsonStr);
+      } catch (e) {
+        console.error("Failed to parse callout JSON", e, calloutText);
+      }
+    }
+
+    return { heroAngle, callouts };
+  });
+};
+
 export const replaceProductInCreative = async (
   creativeFile: File, 
-  productFiles: File[], 
-  aspectRatio: "1:1" | "4:3" | "3:4" | "16:9" | "9:16" = "1:1",
-  dimensions?: { width: number; height: number },
-  abortSignal?: AbortSignal
+  productFile: File, 
+  calloutFiles: { feature: string; file: File }[] = [],
+  abortSignal?: AbortSignal,
+  onProgress?: (progress: number) => void
 ): Promise<string> => {
   return withRetry(async () => {
     const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error("API Key is not set. Please select an API key.");
-  }
-  const ai = new GoogleGenAI({ apiKey });
-
-  const creativePart = await fileToGenerativePart(creativeFile);
-  const productParts = await Promise.all(productFiles.map(fileToGenerativePart));
-
-  const sizeInfo = dimensions 
-    ? `Target Dimensions: ${dimensions.width}x${dimensions.height} pixels (Target Aspect Ratio: ${aspectRatio})` 
-    : `Target Aspect Ratio: ${aspectRatio}`;
-
-  const prompt = `${sizeInfo}
-MODE: SWAP
-
-${UNIVERSAL_PROMPT}`;
-  
-  const textPart = {
-    text: prompt
-  };
-
-  const response = await ai.models.generateContent({
-    model: 'gemini-3-pro-image-preview',
-    contents: {
-      parts: [creativePart, ...productParts, textPart],
-    },
-    config: {
-      imageConfig: {
-        aspectRatio: aspectRatio
-      },
-      abortSignal: abortSignal
+    if (!apiKey) {
+      throw new Error("API Key is not set. Please select an API key.");
     }
-  });
+    const ai = new GoogleGenAI({ apiKey });
 
-  const firstPart = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
+    const parts: any[] = [];
+    parts.push(await fileToGenerativePart(creativeFile));
+    parts.push(await fileToGenerativePart(productFile));
+    
+    for (const cf of calloutFiles) {
+      parts.push(await fileToGenerativePart(cf.file));
+    }
+
+    let dynamicPrompt = SWAP_PROMPT;
+
+    if (calloutFiles.length > 0) {
+      let calloutRefs = `\n\nReference images:\n- IMAGE 1: original design\n- IMAGE 2: new product hero view — use this as the source for the design's main product slot\n`;
+      calloutFiles.forEach((cf, idx) => {
+        calloutRefs += `- IMAGE ${idx + 3}: product ${cf.feature} detail — use this as the reference for the callout related to '${cf.feature}'\n`;
+      });
+      calloutRefs += `\nFor each callout matched by feature, use the provided detail reference image rather than inferring from the hero. Place the detail image inside the callout card at the same crop framing and zoom as the original callout shows. DO NOT KEEP THE ORIGINAL CALLOUT IMAGES IF A DETAIL REFERENCE IMAGE IS PROVIDED FOR IT.\n`;
+      
+      dynamicPrompt += calloutRefs;
+    }
+
+    const textPart = {
+      text: dynamicPrompt
+    };
+    parts.push(textPart);
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-pro-image-preview',
+      contents: {
+        parts: parts,
+      },
+      config: {
+        abortSignal: abortSignal
+      }
+    });
+
+    const firstPart = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
 
     if (firstPart && firstPart.inlineData) {
       const base64ImageBytes: string = firstPart.inlineData.data;
@@ -274,6 +442,8 @@ ${UNIVERSAL_PROMPT}`;
     throw new Error('No image was generated by the API.');
   });
 };
+
+
 
 export const adaptCreativeDimensions = async (
   creativeFile: File,

@@ -1,10 +1,11 @@
 
 import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react';
-import { replaceProductInCreative, adaptCreativeDimensions } from './services/geminiService';
-import { ProcessedImage } from './types';
+import { replaceProductInCreative, adaptCreativeDimensions, classifyProductImage, classifyDesignImage } from './services/geminiService';
+import { ProcessedImage, ClassifiedDesign, ClassifiedProduct, PrimaryAngle, DetailFeature, ImageTag, SmartMatch, CalloutMatch } from './types';
 import { UploadIcon, SparklesIcon, DownloadIcon, XCircleIcon, CheckCircleIcon, AlertCircleIcon, LayersIcon, PackageIcon, HistoryIcon, TrashIcon } from './components/Icons';
 import { motion, AnimatePresence } from 'motion/react';
 import JSZip from 'jszip';
+import { BeforeAfterSlider } from './components/BeforeAfterSlider';
 
 interface BatchHistory {
   id: string;
@@ -12,6 +13,112 @@ interface BatchHistory {
   mode: 'product' | 'size';
   images: ProcessedImage[];
 }
+
+const TAGS: ImageTag[] = [
+  'front', 'back', 'three_quarter', 'side', 'top_down', 'bottom',
+  'interior', 'zipper', 'strap', 'pattern', 'hardware', 'pocket', 'water_resistance', 'size_reference', 'lifestyle'
+];
+
+const TagPill: React.FC<{ 
+  tag?: string; 
+  isClassifying?: boolean;
+  unverified?: boolean;
+  isManual?: boolean;
+  options: string[];
+  onOverride: (tag: string) => void;
+  className?: string;
+}> = ({ tag, isClassifying, unverified, isManual, options, onOverride, className = '' }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const clickOutside = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) setIsOpen(false);
+    };
+    if (isOpen) document.addEventListener('mousedown', clickOutside);
+    return () => document.removeEventListener('mousedown', clickOutside);
+  }, [isOpen]);
+
+  if (isClassifying) {
+    return (
+      <div className={`absolute top-1 left-1 bg-black/60 backdrop-blur-sm border border-white/20 text-white text-[9px] font-mono uppercase px-1.5 py-0.5 rounded flex items-center gap-1 ${className}`}>
+        <span className="w-1.5 h-1.5 bg-purple-400 rounded-full animate-pulse"></span>
+        Detecting...
+      </div>
+    );
+  }
+
+  if (!tag) return null;
+
+  return (
+    <div className={`absolute top-1 left-1 z-10 ${className}`} ref={containerRef}>
+      <button 
+        onClick={() => setIsOpen(!isOpen)}
+        className={`backdrop-blur-sm border text-[9px] font-mono uppercase px-1.5 py-0.5 rounded flex items-center gap-1 transition-colors ${
+          isManual
+            ? 'bg-black/60 border-amber-500/50 text-amber-300 hover:bg-amber-500/20'
+            : unverified 
+              ? 'bg-yellow-500/20 border-yellow-500/50 text-yellow-300 hover:bg-yellow-500/40' 
+              : 'bg-black/60 border-white/20 text-white hover:bg-white/20'
+        }`}
+      >
+        {isManual && <span className="text-amber-500 font-bold">•</span>}
+        {tag.replace('_', ' ')}
+        <span className="opacity-50">▾</span>
+      </button>
+
+      {isOpen && (
+        <div className="absolute top-full left-0 mt-1 w-32 bg-[#1a1a1a] border border-white/10 rounded-lg shadow-xl overflow-hidden py-1 max-h-48 overflow-y-auto z-50">
+          {options.map(t => (
+            <button
+              key={t}
+              onClick={() => { onOverride(t); setIsOpen(false); }}
+              className={`w-full text-left px-3 py-1.5 text-[10px] font-mono uppercase hover:bg-white/10 transition-colors ${tag === t ? 'text-purple-400 bg-purple-500/10' : 'text-gray-300'}`}
+            >
+              {t.replace('_', ' ')}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const SlotPicker: React.FC<{
+  products: ClassifiedProduct[];
+  onSelect: (productId: string) => void;
+  onClose: () => void;
+}> = ({ products, onSelect, onClose }) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  
+  useEffect(() => {
+    const clickOutside = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) onClose();
+    };
+    document.addEventListener('mousedown', clickOutside);
+    return () => document.removeEventListener('mousedown', clickOutside);
+  }, [onClose]);
+
+  return (
+    <div ref={containerRef} className="absolute top-full left-1/2 -translate-x-1/2 mt-2 w-64 bg-[#1a1a1a] border border-white/10 rounded-xl shadow-2xl p-2 z-50">
+      <div className="text-xs font-semibold text-gray-400 mb-2 px-1">Select Product Image</div>
+      <div className="grid grid-cols-4 gap-1.5 max-h-48 overflow-y-auto">
+        {products.map(p => (
+          <button 
+            key={p.id}
+            onClick={(e) => { e.stopPropagation(); onSelect(p.id); onClose(); }}
+            className="aspect-square rounded overflow-hidden border border-white/10 hover:border-purple-500 hover:scale-105 transition-all"
+          >
+            <img src={p.url} className="w-full h-full object-cover" />
+          </button>
+        ))}
+        {products.length === 0 && (
+          <div className="col-span-4 text-xs text-gray-500 py-4 text-center">No products available</div>
+        )}
+      </div>
+    </div>
+  );
+};
 
 const ProcessingItemComponent: React.FC<{ 
   item: ProcessedImage;
@@ -50,6 +157,9 @@ const ProcessingItemComponent: React.FC<{
   else if (item.targetRatio === "9:16") derivedAspectRatio = "9/16";
   else derivedAspectRatio = item.targetDims ? `${item.targetDims.width}/${item.targetDims.height}` : "1/1";
 
+  // If we have a progress inside item, use it. Else use synthetic fakeProgress.
+  const displayProgress = item.progress !== undefined ? item.progress : (item.status === 'completed' ? 100 : fakeProgress);
+
   return (
     <motion.div
       layout
@@ -60,10 +170,10 @@ const ProcessingItemComponent: React.FC<{
     >
       {/* Progress Bar (at the very top edge) */}
       {(item.status === 'processing' || item.status === 'completed') && (
-        <div className="absolute top-0 left-0 w-full h-[3px] bg-transparent z-50 overflow-hidden">
+        <div className="absolute top-0 left-0 w-full h-[4px] bg-transparent z-50 overflow-hidden">
           <div 
             className="h-full bg-indigo-500 transition-all duration-300 ease-out" 
-            style={{ width: `${item.status === 'completed' ? 100 : fakeProgress}%` }}
+            style={{ width: `${displayProgress}%` }}
           />
         </div>
       )}
@@ -105,7 +215,7 @@ const ProcessingItemComponent: React.FC<{
               <div className="flex flex-col items-end gap-1.5 mt-0.5">
                 <div className="flex items-center gap-1.5 text-yellow-500 text-[10px] font-mono uppercase">
                   <div className="w-1.5 h-1.5 rounded-full bg-yellow-500 animate-pulse" />
-                  Processing {Math.round(fakeProgress)}%
+                  Processing {Math.round(displayProgress)}%
                 </div>
                 <button 
                   onClick={() => cancelItem(item.id)} 
@@ -169,33 +279,8 @@ const ProcessingItemComponent: React.FC<{
           </div>
         )}
         {item.status === 'completed' && item.resultUrl && (
-          <div className="w-full h-full relative group">
-            <AnimatePresence mode="wait">
-              {showOriginal ? (
-                <motion.img
-                  key="original"
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  src={item.creativeUrl}
-                  className="w-full h-full object-contain"
-                />
-              ) : (
-                <motion.img
-                  key="result"
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  src={item.resultUrl}
-                  className="w-full h-full object-contain"
-                />
-              )}
-            </AnimatePresence>
-            <div className="absolute top-2 left-2 pointer-events-none">
-                <span className="bg-black/60 backdrop-blur-md px-2 py-1 rounded text-[10px] uppercase font-bold tracking-widest text-white/80 border border-white/10">
-                  {showOriginal ? 'Original' : 'Generated'}
-                </span>
-            </div>
+          <div className="w-full h-full relative group p-2">
+            <BeforeAfterSlider beforeUrl={item.creativeUrl} afterUrl={item.resultUrl} />
           </div>
         )}
         {item.status === 'error' && (
@@ -213,10 +298,17 @@ const ProcessingItemComponent: React.FC<{
 
       {/* Actions */}
       {item.status === 'completed' && item.resultUrl && (
-        <div className="p-3 bg-black/20 border-t border-white/5">
+        <div className="p-3 bg-black/20 border-t border-white/5 flex gap-2">
+          <button
+            onClick={() => regenerateItem(item.id)}
+            className="flex-1 py-2 bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 border border-purple-500/30 text-xs font-bold rounded-lg transition-colors flex items-center justify-center gap-2"
+          >
+            <SparklesIcon className="w-4 h-4" />
+            Regenerate
+          </button>
           <button
             onClick={() => downloadImage(item.resultUrl!, `creative-${item.id}.png`)}
-            className="w-full py-2 bg-white/10 hover:bg-white/20 text-white text-xs font-bold rounded-lg transition-colors flex items-center justify-center gap-2"
+            className="flex-1 py-2 bg-white/10 hover:bg-white/20 text-white border border-white/10 text-xs font-bold rounded-lg transition-colors flex items-center justify-center gap-2"
           >
             <DownloadIcon className="w-4 h-4" />
             Download Result
@@ -229,9 +321,10 @@ const ProcessingItemComponent: React.FC<{
 
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'product' | 'size'>('product');
-  const [creatives, setCreatives] = useState<{ file: File; url: string }[]>([]);
-  const [products, setProducts] = useState<{ file: File; url: string }[]>([]);
+  const [creatives, setCreatives] = useState<ClassifiedDesign[]>([]);
+  const [products, setProducts] = useState<ClassifiedProduct[]>([]);
   const [processedImages, setProcessedImages] = useState<ProcessedImage[]>([]);
+
   const [selectedAspectRatio, setSelectedAspectRatio] = useState<"1:1" | "4:3" | "3:4" | "16:9" | "9:16">("1:1");
   const [selectedResolution, setSelectedResolution] = useState<"1k" | "2k" | "4k" | "8k">("2k");
   const [isCustomDimensions, setIsCustomDimensions] = useState(false);
@@ -249,7 +342,17 @@ const App: React.FC = () => {
   const [isDraggingCreative, setIsDraggingCreative] = useState(false);
   const [isDraggingProduct, setIsDraggingProduct] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
   const abortControllers = useRef(new Map<string, AbortController>());
+
+  // manualOverrides: designId -> { heroSourceId: string, calloutSourceIds: { [feature]: string } }
+  const [manualOverrides, setManualOverrides] = useState<Record<string, { heroSourceId?: string, calloutSourceIds?: Record<string, string> }>>({});
+  const [pickerState, setPickerState] = useState<{designId: string, featureOrHero: string} | null>(null);
+
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 3000);
+  };
 
   const processItem = async (item: ProcessedImage): Promise<ProcessedImage> => {
     const abortController = new AbortController();
@@ -260,12 +363,13 @@ const App: React.FC = () => {
     try {
       let resultUrl: string;
       if (item.activeTab === 'product') {
-        resultUrl = await replaceProductInCreative(item.creativeFile, item.productFiles, item.targetRatio, item.targetDims, abortController.signal);
+        const calloutFiles = (item.calloutFiles || []).map(cf => ({ feature: cf.feature, file: cf.file }));
+        resultUrl = await replaceProductInCreative(item.creativeFile, item.productFiles[0], calloutFiles, abortController.signal);
       } else {
         resultUrl = await adaptCreativeDimensions(item.creativeFile, item.targetRatio, item.targetDims, item.composition, item.textAlignment, abortController.signal);
       }
       
-      const updated = { ...item, status: 'completed' as const, resultUrl, progress: 100 };
+      const updated = { ...item, status: 'completed' as const, resultUrl };
       setProcessedImages(prev => prev.map(p => p.id === item.id ? updated : p));
       return updated;
     } catch (err: any) {
@@ -294,18 +398,26 @@ const App: React.FC = () => {
   };
 
   const regenerateItem = async (id: string) => {
-    // Note: since we don't have a background queue, regenerate processes immediately in the background
-    setProcessedImages(prev => prev.map(p => p.id === id ? { ...p, status: 'pending' } : p));
-    
-    // Slight delay to allow state update before processing
-    setTimeout(async () => {
-      let currentImages: ProcessedImage[] = [];
-      setProcessedImages(prev => { currentImages = prev; return prev; });
-      const itemToProcess = currentImages.find(i => i.id === id);
-      if (itemToProcess) {
-        await processItem(itemToProcess);
-      }
-    }, 50);
+    try {
+      // Note: since we don't have a background queue, regenerate processes immediately in the background
+      setProcessedImages(prev => prev.map(p => p.id === id ? { ...p, status: 'pending' } : p));
+      
+      // Slight delay to allow state update before processing
+      setTimeout(async () => {
+        try {
+          let currentImages: ProcessedImage[] = [];
+          setProcessedImages(prev => { currentImages = prev; return prev; });
+          const itemToProcess = currentImages.find(i => i.id === id);
+          if (itemToProcess) {
+            await processItem(itemToProcess);
+          }
+        } catch (e) {
+          console.error("Regeneration failed:", e);
+        }
+      }, 50);
+    } catch (e) {
+      console.error(e);
+    }
   };
 
   // Load history from localStorage on mount (metadata only usually, but let's see)
@@ -333,25 +445,49 @@ const App: React.FC = () => {
     localStorage.setItem('creative_replacer_history', JSON.stringify(metadata.slice(0, 10))); 
   }, [history]);
 
-  const handleCreativeUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleCreativeUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (files) {
       const newCreatives = Array.from(files).map((file: File) => ({
+        id: `design-${file.name}-${file.lastModified}-${Date.now()}`,
         file,
-        url: URL.createObjectURL(file)
+        url: URL.createObjectURL(file),
+        isClassifying: true
       }));
       setCreatives(prev => [...prev, ...newCreatives]);
+
+      await Promise.all(newCreatives.map(async (item) => {
+        try {
+          const { heroAngle, callouts } = await classifyDesignImage(item.file);
+          setCreatives(prev => prev.map(c => c.id === item.id ? { ...c, isClassifying: false, heroAngle: heroAngle as PrimaryAngle, callouts } : c));
+        } catch (e) {
+          console.error("Design classification failed", e);
+          setCreatives(prev => prev.map(c => c.id === item.id ? { ...c, isClassifying: false, heroAngle: 'front', callouts: [], unverified: true } : c));
+        }
+      }));
     }
   };
 
-  const handleProductUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleProductUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (files) {
       const newProducts = Array.from(files).map((file: File) => ({
+        id: `product-${file.name}-${file.lastModified}-${Date.now()}`,
         file,
-        url: URL.createObjectURL(file)
+        url: URL.createObjectURL(file),
+        isClassifying: true
       }));
       setProducts(prev => [...prev, ...newProducts]);
+
+      await Promise.all(newProducts.map(async (item) => {
+        try {
+          const tag = await classifyProductImage(item.file);
+          setProducts(prev => prev.map(p => p.id === item.id ? { ...p, isClassifying: false, tag: tag as ImageTag } : p));
+        } catch (e) {
+          console.error("Product classification failed", e);
+          setProducts(prev => prev.map(p => p.id === item.id ? { ...p, isClassifying: false, tag: 'three_quarter', unverified: true } : p));
+        }
+      }));
     }
   };
 
@@ -373,143 +509,306 @@ const App: React.FC = () => {
     });
   };
 
-  const pairs = useMemo(() => {
-    const result: { creative: typeof creatives[0]; product: typeof products[0] }[] = [];
-    if (creatives.length === 0 || products.length === 0) return result;
-
-    // Logic: 
-    // If one creative and multiple products -> 1 creative for each product
-    // If multiple creatives and one product -> each creative with that product
-    // If multiple of both -> pair by index
-    
-    if (creatives.length === 1) {
-      products.forEach(p => result.push({ creative: creatives[0], product: p }));
-    } else if (products.length === 1) {
-      creatives.forEach(c => result.push({ creative: c, product: products[0] }));
-    } else {
-      const count = Math.min(creatives.length, products.length);
-      for (let i = 0; i < count; i++) {
-        result.push({ creative: creatives[i], product: products[i] });
+  const handleSlotDrop = (designId: string, featureOrHero: string, productId: string) => {
+    setManualOverrides(prev => {
+      const overrides = prev[designId] || {};
+      if (featureOrHero === 'hero') {
+        return { ...prev, [designId]: { ...overrides, heroSourceId: productId } };
+      } else {
+        return { 
+          ...prev, 
+          [designId]: { 
+            ...overrides, 
+            calloutSourceIds: { ...(overrides.calloutSourceIds || {}), [featureOrHero]: productId } 
+          } 
+        };
       }
+    });
+  };
+
+  const resetRow = (designId: string) => {
+    setManualOverrides(prev => {
+      const next = { ...prev };
+      delete next[designId];
+      return next;
+    });
+  };
+
+  const resetAllMatches = () => {
+    setManualOverrides({});
+  };
+
+  const overrideTag = (id: string, type: 'creative' | 'product', tag: string) => {
+    if (type === 'creative') {
+      setCreatives(prev => prev.map(p => p.id === id ? { ...p, heroAngle: tag as PrimaryAngle, unverified: false, manualHeroAngle: true } : p));
+    } else {
+      setProducts(prev => prev.map(p => p.id === id ? { ...p, tag: tag as ImageTag, unverified: false, manualTag: true } : p));
     }
-    return result;
-  }, [creatives, products]);
+    showToast(`Classification updated — matches recomputed`);
+  };
+
+  const smartMatches = useMemo<SmartMatch[]>(() => {
+    return creatives.map(design => {
+      let heroSource = null;
+      let heroMatchType: 'exact' | 'approximate' | 'missing' | 'custom' = 'missing';
+
+      const override = manualOverrides[design.id];
+
+      // Check overrides first
+      if (override?.heroSourceId) {
+        heroSource = products.find(p => p.id === override.heroSourceId) || null;
+        if (heroSource) heroMatchType = 'custom';
+      }
+
+      if (!heroSource && products.length > 0) {
+        let match = products.find(p => p.tag === design.heroAngle);
+        if (match) {
+          heroSource = match;
+          heroMatchType = 'exact';
+        } else {
+          // Fallback logic
+          const fallbacks: Record<string, string[]> = {
+            'three_quarter': ['front', 'side', 'back'],
+            'front': ['three_quarter', 'side'],
+            'back': ['three_quarter', 'front'],
+            'side': ['three_quarter', 'front'],
+            'top_down': ['front', 'three_quarter'],
+            'bottom': ['front', 'three_quarter']
+          };
+          const needed = design.heroAngle || 'front';
+          for (const fallback of fallbacks[needed] || []) {
+            let m = products.find(p => p.tag === fallback);
+            if (m) {
+              heroSource = m;
+              heroMatchType = 'approximate';
+              break;
+            }
+          }
+          if (!heroSource) {
+             heroSource = products[0]; // fallback to first image
+             heroMatchType = 'approximate';
+          }
+        }
+      }
+
+      // Find callouts
+      const calloutSources: CalloutMatch[] = (design.callouts || []).map(co => {
+        if (override?.calloutSourceIds?.[co.feature]) {
+          const source = products.find(p => p.id === override.calloutSourceIds![co.feature]) || null;
+          if (source) return { feature: co.feature as DetailFeature, source, matchType: 'custom' };
+        }
+
+        const source = products.find(p => p.tag === co.feature);
+        if (source) {
+          return { feature: co.feature as DetailFeature, source, matchType: 'exact' };
+        }
+        return { feature: co.feature as DetailFeature, source: null, matchType: 'reconstruction' };
+      });
+
+      let overallMatchType: 'exact' | 'approximate' | 'mixed' | 'missing' | 'custom' = 'exact';
+
+      const hasApproxCallout = calloutSources.some(c => c.matchType === 'reconstruction');
+      const hasExactCallout = calloutSources.some(c => c.matchType === 'exact');
+      
+      const allManuallyOrExactOverridden = (heroMatchType === 'exact' || heroMatchType === 'custom') && 
+        calloutSources.every(c => c.matchType === 'exact' || c.matchType === 'custom');
+      
+      const hasCustom = heroMatchType === 'custom' || calloutSources.some(c => c.matchType === 'custom');
+
+      if (heroMatchType === 'missing') {
+        overallMatchType = 'missing';
+      } else if (hasCustom && allManuallyOrExactOverridden) {
+        overallMatchType = 'custom';
+      } else if (heroMatchType === 'exact' && !hasApproxCallout && !hasCustom) {
+        overallMatchType = 'exact';
+      } else if (heroMatchType === 'approximate' && !hasExactCallout && !hasCustom) {
+        overallMatchType = 'approximate';
+      } else {
+        overallMatchType = 'mixed';
+      }
+
+      return {
+        design,
+        heroSource,
+        heroMatchType,
+        calloutSources,
+        overallMatchType
+      };
+    });
+  }, [creatives, products, manualOverrides]);
+
+  const processGroupConc = async (items: ProcessedImage[], concurrency: number) => {
+    const results = [...items];
+    let index = 0;
+
+    const runWorker = async () => {
+      while (index < results.length) {
+        const i = index++;
+        
+        // Before starting this item, check if it was cancelled
+        let currentStatus = 'pending';
+        setProcessedImages(prev => {
+          const currentItem = prev.find(p => p.id === results[i].id);
+          if (currentItem) currentStatus = currentItem.status;
+          return prev;
+        });
+
+        if (currentStatus === 'cancelled') {
+          continue;
+        }
+
+        results[i] = await processItem(results[i]);
+      }
+    };
+
+    const workers = [];
+    for (let c = 0; c < Math.min(concurrency, items.length); c++) {
+      workers.push(runWorker());
+    }
+    await Promise.all(workers);
+    return results;
+  };
 
   const startBatchProcessing = async () => {
-    if (creatives.length === 0) return;
-    if (activeTab === 'product' && products.length === 0) return;
+    try {
+      if (activeTab === 'product' && smartMatches.length === 0) return;
+      if (activeTab === 'size' && creatives.length === 0) return;
 
-    // Determine final aspect ratio and dimensions
-    let finalRatio = selectedAspectRatio;
-    const resMap = { "1k": 1024, "2k": 2048, "4k": 4096, "8k": 7680 };
-    const baseSize = resMap[selectedResolution];
-    let dims: { width: number; height: number } = { width: baseSize, height: baseSize };
+      // Determine final aspect ratio and dimensions
+      let finalRatio = selectedAspectRatio;
+      const resMap = { "1k": 1024, "2k": 2048, "4k": 4096, "8k": 7680 };
+      const baseSize = resMap[selectedResolution];
+      let dims: { width: number; height: number } = { width: baseSize, height: baseSize };
 
-    if (isCustomDimensions) {
-      dims = { width: customWidth, height: customHeight };
-      const ratio = customWidth / customHeight;
-      if (ratio > 1.5) finalRatio = "16:9";
-      else if (ratio > 1.1) finalRatio = "4:3";
-      else if (ratio > 0.9) finalRatio = "1:1";
-      else if (ratio > 0.6) finalRatio = "3:4";
-      else finalRatio = "9:16";
-    } else {
-      // Calculate resolution-aware presets
-      if (selectedAspectRatio === "1:1") dims = { width: baseSize, height: baseSize };
-      else if (selectedAspectRatio === "4:3") dims = { width: baseSize, height: Math.round(baseSize * 0.75) };
-      else if (selectedAspectRatio === "3:4") dims = { width: Math.round(baseSize * 0.75), height: baseSize };
-      else if (selectedAspectRatio === "16:9") dims = { width: baseSize, height: Math.round(baseSize * 0.5625) };
-      else if (selectedAspectRatio === "9:16") dims = { width: Math.round(baseSize * 0.5625), height: baseSize };
-    }
+      if (isCustomDimensions) {
+        dims = { width: customWidth, height: customHeight };
+        const ratio = customWidth / customHeight;
+        if (ratio > 1.5) finalRatio = "16:9";
+        else if (ratio > 1.1) finalRatio = "4:3";
+        else if (ratio > 0.9) finalRatio = "1:1";
+        else if (ratio > 0.6) finalRatio = "3:4";
+        else finalRatio = "9:16";
+      } else {
+        // Calculate resolution-aware presets
+        if (selectedAspectRatio === "1:1") dims = { width: baseSize, height: baseSize };
+        else if (selectedAspectRatio === "4:3") dims = { width: baseSize, height: Math.round(baseSize * 0.75) };
+        else if (selectedAspectRatio === "3:4") dims = { width: Math.round(baseSize * 0.75), height: baseSize };
+        else if (selectedAspectRatio === "16:9") dims = { width: baseSize, height: Math.round(baseSize * 0.5625) };
+        else if (selectedAspectRatio === "9:16") dims = { width: Math.round(baseSize * 0.5625), height: baseSize };
+      }
 
-    // API Key Selection for high-quality models
-    const aistudio = (window as any).aistudio;
-    if (aistudio && !(await aistudio.hasSelectedApiKey())) {
-      await aistudio.openSelectKey();
-      // Assume success and proceed as per instructions
-    }
-    
-    setIsProcessing(true);
-    setError(null);
-    
-    const initialProcessed: ProcessedImage[] = creatives.map((creative, idx) => ({
-      id: `${Date.now()}-${idx}`,
-      creativeFile: creative.file,
-      productFiles: activeTab === 'product' ? products.map(p => p.file) : [],
-      creativeUrl: creative.url,
-      productUrls: activeTab === 'product' ? products.map(p => p.url) : [],
-      status: 'pending',
-      targetRatio: finalRatio,
-      targetDims: dims,
-      composition: composition,
-      textAlignment: textAlignment,
-      activeTab: activeTab
-    }));
-    
-    setProcessedImages(initialProcessed);
-
-    const results: ProcessedImage[] = [];
-
-    for (let i = 0; i < initialProcessed.length; i++) {
-      // Check if it was cancelled while waiting in queue
-      let currentStatus = 'pending';
-      setProcessedImages(prev => {
-        const currentItem = prev.find(p => p.id === initialProcessed[i].id);
-        if (currentItem) currentStatus = currentItem.status;
-        return prev;
-      });
-      
-      if (currentStatus === 'cancelled') {
-         results.push({ ...initialProcessed[i], status: 'cancelled' });
-         continue;
+      // API Key Selection for high-quality models
+      const aistudio = (window as any).aistudio;
+      if (aistudio && !(await aistudio.hasSelectedApiKey())) {
+        await aistudio.openSelectKey();
       }
       
-      const result = await processItem(initialProcessed[i]);
-      results.push(result);
-    }
-    
-    // Add to history
-    setHistory(prev => [{
-      id: `batch-${Date.now()}`,
-      timestamp: Date.now(),
-      mode: activeTab,
-      images: results
-    }, ...prev]);
+      setIsProcessing(true);
+      setError(null);
+      
+      let initialProcessed: ProcessedImage[] = [];
 
-    setIsProcessing(false);
+      if (activeTab === 'product') {
+        initialProcessed = smartMatches.map((match, idx) => {
+          const heroFile = match.heroSource?.file || products[0]?.file;
+          const heroUrl = match.heroSource?.url || products[0]?.url;
+          
+          const validCallouts = match.calloutSources.filter(c => c.matchType === 'exact' && c.source?.file);
+          const calloutFiles = validCallouts.map(c => ({
+            feature: c.feature,
+            file: c.source!.file,
+            url: c.source!.url
+          }));
+
+          const allProductFiles = [heroFile, ...validCallouts.map(c => c.source!.file)].filter(Boolean) as File[];
+          const allProductUrls = [heroUrl, ...validCallouts.map(c => c.source!.url)].filter(Boolean) as string[];
+
+          return {
+            id: `${Date.now()}-${idx}`,
+            creativeFile: match.design.file,
+            productFiles: allProductFiles,
+            creativeUrl: match.design.url,
+            productUrls: allProductUrls,
+            calloutFiles: calloutFiles,
+            status: 'pending',
+            targetRatio: finalRatio,
+            targetDims: dims,
+            composition: composition,
+            textAlignment: textAlignment,
+            activeTab: activeTab,
+            smartMatch: match
+          };
+        });
+      } else {
+        initialProcessed = creatives.map((creative, idx) => ({
+          id: `${Date.now()}-${idx}`,
+          creativeFile: creative.file,
+          productFiles: [],
+          creativeUrl: creative.url,
+          productUrls: [],
+          status: 'pending',
+          targetRatio: finalRatio,
+          targetDims: dims,
+          composition: composition,
+          textAlignment: textAlignment,
+          activeTab: activeTab
+        }));
+      }
+      
+      setProcessedImages(initialProcessed);
+
+      const results = await processGroupConc(initialProcessed, 3);
+      
+      setIsProcessing(false);
+      
+      setHistory(prev => [{
+        id: `batch-${Date.now()}`,
+        timestamp: Date.now(),
+        mode: activeTab,
+        images: results
+      }, ...prev]);
+    } catch (err: any) {
+      console.error("Batch processing error:", err);
+      setError(err.message || "An unexpected error occurred during setup.");
+      setIsProcessing(false);
+    }
   };
 
   const downloadAllAsZip = async (images: ProcessedImage[]) => {
-    const zip = new JSZip();
-    const completedImages = images.filter(img => img.status === 'completed' && img.resultUrl);
-    
-    if (completedImages.length === 0) return;
+    try {
+      const zip = new JSZip();
+      const completedImages = images.filter(img => img.status === 'completed' && img.resultUrl);
+      
+      if (completedImages.length === 0) return;
 
-    for (let i = 0; i < completedImages.length; i++) {
-      const img = completedImages[i];
-      try {
-        const response = await fetch(img.resultUrl!);
-        const blob = await response.blob();
-        
-        // Use original filename with extension
-        const originalName = img.creativeFile.name;
-        const nameWithoutExt = originalName.substring(0, originalName.lastIndexOf('.'));
-        const ext = originalName.substring(originalName.lastIndexOf('.'));
-        zip.file(`${nameWithoutExt}-edited${ext}`, blob);
-      } catch (e) {
-        console.error("Failed to add file to zip", img.creativeFile.name, e);
+      for (let i = 0; i < completedImages.length; i++) {
+        const img = completedImages[i];
+        try {
+          const response = await fetch(img.resultUrl!);
+          const blob = await response.blob();
+          
+          // Use original filename with extension
+          const originalName = img.creativeFile.name;
+          const nameWithoutExt = originalName.substring(0, originalName.lastIndexOf('.'));
+          const ext = originalName.substring(originalName.lastIndexOf('.'));
+          zip.file(`${nameWithoutExt}-edited${ext}`, blob);
+        } catch (e) {
+          console.error("Failed to add file to zip", img.creativeFile.name, e);
+        }
       }
-    }
 
-    const content = await zip.generateAsync({ type: 'blob' });
-    const url = URL.createObjectURL(content);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `creative-batch-${Date.now()}.zip`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(content);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `creative-batch-${Date.now()}.zip`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error("Failed to generate zip", e);
+    }
   };
 
   const clearHistory = () => {
@@ -528,6 +827,20 @@ const App: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-[#e5e5e5] font-sans selection:bg-purple-500/30">
+      <AnimatePresence>
+        {toastMessage && (
+          <motion.div
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            className="fixed top-24 left-1/2 -translate-x-1/2 z-[100] bg-black/80 backdrop-blur-md border border-white/20 text-white px-4 py-2 rounded-full shadow-2xl flex items-center gap-2"
+          >
+            <CheckCircleIcon className="w-4 h-4 text-green-400" />
+            <span className="text-sm font-medium">{toastMessage}</span>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Header */}
       <header className="border-b border-white/10 p-6 backdrop-blur-md sticky top-0 z-50 bg-black/50">
         <div className="max-w-7xl mx-auto flex flex-col md:flex-row justify-between items-center gap-4">
@@ -570,7 +883,7 @@ const App: React.FC = () => {
                   </span>
                 )}
               </button>
-             {(activeTab === 'product' ? (creatives.length > 0 && products.length > 0) : creatives.length > 0) && (
+             {(activeTab === 'product' ? smartMatches.length > 0 : creatives.length > 0) && (
                 <button
                   onClick={startBatchProcessing}
                   disabled={isProcessing}
@@ -585,7 +898,7 @@ const App: React.FC = () => {
                       {activeTab === 'product' ? 'Replacing...' : 'Adapting...'}
                     </span>
                   ) : (
-                    <>Process {creatives.length} {activeTab === 'product' ? 'Replacements' : 'Adaptations'}</>
+                    <>Process {activeTab === 'product' ? smartMatches.length : creatives.length} {activeTab === 'product' ? 'Replacements' : 'Adaptations'}</>
                   )}
                 </button>
              )}
@@ -601,10 +914,11 @@ const App: React.FC = () => {
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-semibold flex items-center gap-2">
                 <LayersIcon className="w-5 h-5 text-purple-400" />
-                1. Original Creatives
+                {activeTab === 'product' ? '1. Parent Designs' : '1. Original Creatives'}
               </h2>
               <span className="text-xs font-mono text-gray-500">{creatives.length} uploaded</span>
             </div>
+
             <div className={`relative group transition-all duration-300 ${isDraggingCreative ? 'scale-[1.02]' : ''}`}>
               <div 
                 className={`border-2 border-dashed rounded-2xl p-8 text-center transition-all bg-white/5 ${
@@ -620,7 +934,7 @@ const App: React.FC = () => {
                   isDraggingCreative ? 'text-purple-400' : 'text-gray-600 group-hover:text-purple-400'
                 }`} />
                 <p className={`text-sm transition-colors ${isDraggingCreative ? 'text-purple-300' : 'text-gray-400'}`}>
-                  {isDraggingCreative ? 'Drop to Add Creatives' : 'Drop creative templates here'}
+                  {isDraggingCreative ? 'Drop to Add Creatives' : 'Drop creative images here'}
                 </p>
                 <input
                   type="file"
@@ -634,13 +948,26 @@ const App: React.FC = () => {
             <div className="grid grid-cols-4 sm:grid-cols-6 gap-2">
               {creatives.map((c, i) => (
                 <div key={i} className="relative aspect-square rounded-lg overflow-hidden border border-white/10 group">
+                  <TagPill 
+                    tag={c.heroAngle} 
+                    isClassifying={c.isClassifying} 
+                    unverified={c.unverified}
+                    isManual={c.manualHeroAngle}
+                    options={TAGS.filter(t => ['front', 'back', 'three_quarter', 'side', 'top_down', 'bottom'].includes(t))}
+                    onOverride={(tag) => overrideTag(c.id, 'creative', tag)}
+                  />
                   <img src={c.url} className="w-full h-full object-cover" />
                   <button 
                     onClick={() => removeCreative(i)}
-                    className="absolute top-1 right-1 p-1 bg-black/50 rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
+                    className="absolute top-1 right-1 p-1 bg-black/50 rounded-full opacity-0 group-hover:opacity-100 transition-opacity z-20"
                   >
                     <XCircleIcon className="w-4 h-4 text-red-400" />
                   </button>
+                  {c.callouts && c.callouts.length > 0 && (
+                    <div className="absolute bottom-1 right-1 bg-black/60 text-white text-[9px] rounded px-1 z-20">
+                      {c.callouts.length} callouts
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -684,11 +1011,27 @@ const App: React.FC = () => {
               </div>
               <div className="grid grid-cols-4 sm:grid-cols-6 gap-2">
                 {products.map((p, i) => (
-                  <div key={i} className="relative aspect-square rounded-lg overflow-hidden border border-white/10 group">
+                  <div 
+                    key={i} 
+                    className="relative aspect-square rounded-lg overflow-hidden border border-white/10 group pt-[1px] cursor-grab active:cursor-grabbing"
+                    draggable
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData('text/plain', p.id);
+                      e.dataTransfer.effectAllowed = 'copy';
+                    }}
+                  >
+                    <TagPill 
+                      tag={p.tag} 
+                      isClassifying={p.isClassifying} 
+                      unverified={p.unverified}
+                      isManual={p.manualTag}
+                      options={TAGS}
+                      onOverride={(tag) => overrideTag(p.id, 'product', tag)}
+                    />
                     <img src={p.url} className="w-full h-full object-cover" />
                     <button 
                       onClick={() => removeProduct(i)}
-                      className="absolute top-1 right-1 p-1 bg-black/50 rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
+                      className="absolute top-1 right-1 p-1 bg-black/50 rounded-full opacity-0 group-hover:opacity-100 transition-opacity z-20"
                     >
                       <XCircleIcon className="w-4 h-4 text-red-400" />
                     </button>
@@ -698,6 +1041,180 @@ const App: React.FC = () => {
             </div>
           )}
         </section>
+
+        {/* Smart Matches Table */}
+        {activeTab === 'product' && (creatives.length > 0 || products.length > 0) && (
+          <section className="space-y-4">
+            <div className="flex items-center justify-between border-b border-white/10 pb-2">
+              <h2 className="text-lg font-semibold">Smart Matches</h2>
+              {Object.keys(manualOverrides).length > 0 && (
+                <button 
+                  onClick={resetAllMatches}
+                  className="text-xs text-amber-400 hover:text-amber-300 transition-colors uppercase font-bold tracking-wider flex items-center gap-1"
+                >
+                  <XCircleIcon className="w-3 h-3" />
+                  Reset All Overrides
+                </button>
+              )}
+            </div>
+            
+            <div className="flex flex-col gap-2">
+              {smartMatches.map((match, idx) => (
+                <div key={idx} className="flex flex-col bg-white/5 border border-white/10 rounded-xl overflow-hidden p-3 gap-3 relative group/row">
+                  {manualOverrides[match.design.id] && (
+                    <button 
+                      onClick={() => resetRow(match.design.id)}
+                      className="absolute top-2 right-2 p-1 bg-black/40 hover:bg-black/60 rounded text-gray-400 hover:text-amber-400 transition-colors opacity-0 group-hover/row:opacity-100"
+                      title="Reset manual overrides for this row"
+                    >
+                      <XCircleIcon className="w-4 h-4" />
+                    </button>
+                  )}
+                  <div className="flex items-center gap-4">
+                    {/* Design side */}
+                    <div className="flex items-center gap-3 w-[250px] shrink-0">
+                      <div className="w-12 h-12 rounded overflow-hidden relative shrink-0">
+                        <img src={match.design.url} className="w-full h-full object-cover" />
+                      </div>
+                      <div className="flex flex-col">
+                        <span className="text-sm font-medium text-white truncate max-w-[150px]" title={match.design.file.name}>{match.design.file.name}</span>
+                        <span className="text-[10px] text-gray-400 font-mono flex items-center gap-1">
+                          Hero: <span className="uppercase text-purple-400">{match.design.heroAngle || 'unknown'}</span>
+                        </span>
+                      </div>
+                    </div>
+                    
+                    <div className="text-gray-500 font-mono shrink-0 px-2 text-xl">→</div>
+
+                    {/* Matched Products side */}
+                    <div className="flex items-center gap-3 overflow-x-auto pb-1 scrollbar-hide flex-1">
+                      {/* Hero Image Match */}
+                      <div 
+                        className="flex flex-col items-center gap-1 w-12 shrink-0 group/slot rounded transition-colors border border-transparent outline-none focus-visible:ring-2 focus-visible:ring-purple-500 relative cursor-pointer"
+                        tabIndex={0}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setPickerState({ designId: match.design.id, featureOrHero: 'hero' });
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setPickerState({ designId: match.design.id, featureOrHero: 'hero' });
+                          }
+                        }}
+                        onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('bg-white/10', 'border-white/30'); }}
+                        onDragLeave={(e) => { e.currentTarget.classList.remove('bg-white/10', 'border-white/30'); }}
+                        onDrop={(e) => {
+                            e.preventDefault();
+                            e.currentTarget.classList.remove('bg-white/10', 'border-white/30');
+                            const productId = e.dataTransfer.getData('text/plain');
+                            if (productId) handleSlotDrop(match.design.id, 'hero', productId);
+                        }}
+                      >
+                        {pickerState?.designId === match.design.id && pickerState?.featureOrHero === 'hero' && (
+                          <SlotPicker 
+                            products={products} 
+                            onSelect={(id) => handleSlotDrop(match.design.id, 'hero', id)} 
+                            onClose={() => setPickerState(null)} 
+                          />
+                        )}
+                        {match.heroSource ? (
+                          <div className={`w-12 h-12 rounded overflow-hidden border relative ${match.heroMatchType === 'custom' ? 'border-amber-500/80 shadow-[0_0_8px_rgba(245,158,11,0.2)]' : match.heroMatchType === 'exact' ? 'border-green-500/50' : 'border-yellow-500/50'}`}>
+                            <img src={match.heroSource.url} className="w-full h-full object-cover" />
+                            {match.heroMatchType === 'custom' && <div className="absolute top-0 right-0 bg-amber-500/90 backdrop-blur-sm text-black text-[7px] font-bold px-1 rounded-bl">M</div>}
+                          </div>
+                        ) : (
+                          <div className="w-12 h-12 rounded border border-dashed border-red-500/30 flex items-center justify-center bg-red-500/5 pointer-events-none">
+                            <span className="text-[8px] text-red-400 uppercase">Missing</span>
+                          </div>
+                        )}
+                        <span className="text-[8px] text-gray-400 uppercase w-full text-center truncate">Hero</span>
+                      </div>
+
+                      {/* Callout matches */}
+                      {match.calloutSources.map((co, coIdx) => (
+                        <div 
+                          key={coIdx} 
+                          className="flex flex-col items-center gap-1 w-12 shrink-0 group/slot rounded transition-colors border border-transparent outline-none focus-visible:ring-2 focus-visible:ring-purple-500 relative cursor-pointer"
+                          tabIndex={0}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setPickerState({ designId: match.design.id, featureOrHero: co.feature });
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              setPickerState({ designId: match.design.id, featureOrHero: co.feature });
+                            }
+                          }}
+                          onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('bg-white/10', 'border-white/30'); }}
+                          onDragLeave={(e) => { e.currentTarget.classList.remove('bg-white/10', 'border-white/30'); }}
+                          onDrop={(e) => {
+                              e.preventDefault();
+                              e.currentTarget.classList.remove('bg-white/10', 'border-white/30');
+                              const productId = e.dataTransfer.getData('text/plain');
+                              if (productId) handleSlotDrop(match.design.id, co.feature, productId);
+                          }}
+                        >
+                          {pickerState?.designId === match.design.id && pickerState?.featureOrHero === co.feature && (
+                            <SlotPicker 
+                              products={products} 
+                              onSelect={(id) => handleSlotDrop(match.design.id, co.feature, id)} 
+                              onClose={() => setPickerState(null)} 
+                            />
+                          )}
+                          {co.source ? (
+                            <div className={`w-12 h-12 rounded overflow-hidden border relative ${co.matchType === 'custom' ? 'border-amber-500/80 shadow-[0_0_8px_rgba(245,158,11,0.2)]' : 'border-green-500/50'}`}>
+                              <img src={co.source.url} className="w-full h-full object-cover" />
+                              <div className="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity">
+                                <span className="text-[8px] text-white uppercase text-center break-words">{co.feature.replace('_',' ')}</span>
+                              </div>
+                              {co.matchType === 'custom' && <div className="absolute top-0 right-0 bg-amber-500/90 backdrop-blur-sm text-black text-[7px] font-bold px-1 rounded-bl z-10">M</div>}
+                            </div>
+                          ) : (
+                            <div className="w-12 h-12 rounded border border-dashed border-yellow-500/50 flex flex-col items-center justify-center bg-yellow-500/10 p-1 pointer-events-none" title={co.feature}>
+                              <SparklesIcon className="w-3 h-3 text-yellow-400 mb-1" />
+                              <span className="text-[7px] text-yellow-400 uppercase text-center leading-tight">AI<br/>Gen</span>
+                            </div>
+                          )}
+                          <span className="text-[8px] text-gray-400 uppercase w-full text-center truncate" title={co.feature}>{co.feature.replace('_',' ')}</span>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Overall Status Badge */}
+                    <div className="shrink-0 flex pr-6">
+                       {match.overallMatchType === 'custom' && <span className="text-[10px] uppercase font-bold text-amber-400 border border-amber-500/30 bg-amber-500/10 px-2 py-1 rounded">Custom</span>}
+                       {match.overallMatchType === 'exact' && <span className="text-[10px] uppercase font-bold text-green-400 border border-green-500/30 bg-green-500/10 px-2 py-1 rounded">Exact</span>}
+                       {match.overallMatchType === 'approximate' && <span className="text-[10px] uppercase font-bold text-yellow-400 border border-yellow-500/30 bg-yellow-500/10 px-2 py-1 rounded flex items-center gap-1"><AlertCircleIcon className="w-3 h-3"/> Approximate</span>}
+                       {match.overallMatchType === 'mixed' && <span className="text-[10px] uppercase font-bold text-yellow-400 border border-yellow-500/30 bg-yellow-500/10 px-2 py-1 rounded flex items-center gap-1"><AlertCircleIcon className="w-3 h-3"/> Mixed</span>}
+                       {match.overallMatchType === 'missing' && <span className="text-[10px] uppercase font-bold text-red-400 border border-red-500/30 bg-red-500/10 px-2 py-1 rounded flex items-center gap-1"><XCircleIcon className="w-3 h-3"/> Missing</span>}
+                    </div>
+                  </div>
+                </div>
+              ))}
+              {smartMatches.length === 0 && (
+                <div className="text-sm text-gray-500 italic p-4 text-center border border-dashed border-white/10 rounded-xl">Upload both designs and products to compute matches.</div>
+              )}
+            </div>
+
+            {smartMatches.length > 0 && (
+              <div className="flex items-center justify-center mt-2">
+                <div className="text-xs text-gray-400 flex items-center gap-2">
+                  <span className="font-bold text-white">{smartMatches.length} designs</span>
+                  <span>·</span>
+                  <span className="text-green-400">{smartMatches.filter(m => m.overallMatchType === 'exact').length} exact</span>
+                  <span>·</span>
+                  <span className="text-yellow-400">{smartMatches.filter(m => m.overallMatchType === 'approximate').length} approx</span>
+                  <span>·</span>
+                  <span className="text-yellow-400">{smartMatches.filter(m => m.overallMatchType === 'mixed').length} mixed</span>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
 
         {/* Adaptation Options */}
         <section className="space-y-4">
